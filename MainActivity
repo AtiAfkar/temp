@@ -1,0 +1,513 @@
+package com.vouria.app.hamrahab
+
+import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.Uri
+import android.net.http.SslError
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.util.Log
+import android.view.KeyEvent
+import android.view.View
+import android.view.WindowManager
+import android.webkit.*
+import android.widget.Button
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.databinding.DataBindingUtil
+import com.google.android.material.snackbar.Snackbar
+import com.karumi.dexter.Dexter
+import com.karumi.dexter.DexterBuilder
+import com.karumi.dexter.MultiplePermissionsReport
+import com.karumi.dexter.PermissionToken
+import com.karumi.dexter.listener.multi.MultiplePermissionsListener
+import com.vouria.app.hamrahab.databinding.ActivityMainBinding
+
+
+class MainActivity : AppCompatActivity() {
+    companion object {
+        private const val RESULT_PERMISSION_OK: Int = 0
+        private const val REQUEST_PERMISSION: Int = 200
+        private const val FILE_CHOOSER_RESULT_CODE = 1
+        private const val REQUEST_SELECT_FILE = 100
+        private const val BACK_TO_LOGIN_URL =
+            "https://sanjab.abfahormozgan.com/sanjabMobile/#/android/clientactions/androidMain"
+        private const val BACK_IN_LOGIN_URL =
+            "https://sanjab.abfahormozgan.com/sanjabMobile/#/login"
+        private const val USER_AGENT_APPENDED: String = "-HamrahAb"
+        private const val URL = "https://sanjab.abfahormozgan.com/sanjabMobile"
+    }
+    //    private val URL = "https://sanjab.abfahormozgan.com/sanjabMobileSistan"
+    //    private val URL = "http://192.168.4.5/sanjabMobile/#/login"
+    //    private val URL = "https://time.ir"
+    //    private val URL = "https://en.wikipedia.org/wiki/Wiki"
+    //    private val URL = "https://www.filemail.com/share/upload-file"
+
+    private val showLog: Boolean = false
+    private var currentUrl: String = URL
+    lateinit var alertDialog: AlertDialog
+    lateinit var binding: ActivityMainBinding
+    private var errorPage: Boolean = false
+    lateinit var dexter: DexterBuilder
+    private var resultLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            dexter.check()
+        }
+    private var resultUploadLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (null == mUploadMessage || result == null) {
+                mUploadMessage!!.onReceiveValue(null)
+                mUploadMessage = null
+                fileProviding(intent)
+            } else {
+                showToastMessage(R.string.not_found_file)
+            }
+        }
+    private var mUploadMessage: ValueCallback<Array<Uri>>? = null
+
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = DataBindingUtil.setContentView(this, R.layout.activity_main)
+        setContentView(binding.root)
+
+        checkPermission()
+
+        binding.swipRefresh.setOnRefreshListener {
+            refreshWebview()
+        }
+        binding.btnTryAgain.setOnClickListener {
+//            setUpWebView()
+//            checkPermission()
+            errorPage = false
+            binding.webview.reload()
+        }
+    }
+
+
+    private fun refreshWebview() {
+        if (isNetworkConnected()) {
+            binding.swipRefresh.isRefreshing = true
+            binding.webview.clearCache(true)
+            binding.webview.reload()
+        } else binding.swipRefresh.isRefreshing = false
+    }
+
+
+    private fun checkPermission() {
+        dexter = Dexter.withActivity(this)
+            .withPermissions(
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                android.Manifest.permission.READ_EXTERNAL_STORAGE
+            ).withListener(object : MultiplePermissionsListener {
+                override fun onPermissionsChecked(report: MultiplePermissionsReport) {
+                    report.let {
+
+                        if (report.areAllPermissionsGranted()) {
+                            setUpWebView()
+                        } else {
+                            showPermissionAlert()
+                        }
+                    }
+                }
+
+                override fun onPermissionRationaleShouldBeShown(
+                    permissions: MutableList<com.karumi.dexter.listener.PermissionRequest>?,
+                    token: PermissionToken?
+                ) {
+                    token?.continuePermissionRequest()
+
+                }
+
+            }).withErrorListener {
+                logShow(it.name)
+            }
+        dexter.check()
+    }
+
+    private fun showPermissionAlert() {
+        AlertDialog.Builder(this@MainActivity)
+            .apply {
+                setMessage(R.string.please_activte_permission)
+                    .setCancelable(false)
+                    .setPositiveButton(R.string.setting) { _, _ ->
+                        goToPermissionSetting()
+                    }
+                setNegativeButton(R.string.cancel) { dialog, _ ->
+                    dialog.cancel()
+                    finish()
+                }
+                val alert = this.create()
+                alert.show()
+            }
+    }
+
+    private fun goToPermissionSetting() {
+        val reqIntent =
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .apply {
+                    val uri = Uri.fromParts(
+                        "package",
+                        packageName,
+                        null
+                    )
+                    data = uri
+                }
+        startActivityForResult(reqIntent, REQUEST_PERMISSION)
+//                                            resultLauncher.launch(reqIntent)
+    }
+
+    fun setUpWebView() {
+
+        if (isNetworkConnected()) {
+            errorPage = false
+            showAnimation()
+
+            initWebviewSetting()
+
+            addWebViewClient()
+            addWebChromeClient()
+
+            runOnUiThread {
+                logShow("loadURL==> $currentUrl")
+                binding.webview.loadUrl(currentUrl)
+                Snackbar.make(
+                    binding.root,
+                    R.string.connecting,
+                    Snackbar.LENGTH_LONG
+                ).show()
+            }
+        } else {
+            showErrorPage()
+            showToastMessage(R.string.please_check_your_network)
+        }
+
+    }
+
+    private fun addWebViewClient() {
+        binding.webview.webViewClient = object : WebViewClient() {
+
+            override fun shouldOverrideUrlLoading(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): Boolean {
+                logShow("shouldOverrideUrlLoading")
+
+                currentUrl = request?.url.toString()
+//                binding.webview.loadUrl(currentUrl)
+                return super.shouldOverrideUrlLoading(view, request)
+            }
+
+            override fun shouldOverrideKeyEvent(view: WebView?, event: KeyEvent?): Boolean {
+                return super.shouldOverrideKeyEvent(view, event)
+            }
+
+            override fun onReceivedLoginRequest(
+                view: WebView?,
+                realm: String?,
+                account: String?,
+                args: String?
+            ) {
+                super.onReceivedLoginRequest(view, realm, account, args)
+                logShow("onReceivedLoginRequest")
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                logShow("onPageStarted")
+                super.onPageStarted(view, url, favicon)
+                showAnimation()
+                hideErrorPage()
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                logShow("onPageFinished")
+                hideAnimation()
+                currentUrl = url.toString()
+                binding.swipRefresh.isRefreshing = false
+                if (errorPage) {
+                    showErrorPage()
+                } else {
+                    showWebview()
+                }
+            }
+
+//            override fun onReceivedHttpError(
+//                view: WebView?,
+//                request: WebResourceRequest?,
+//                errorResponse: WebResourceResponse?
+//            ) {
+//                super.onReceivedHttpError(view, request, errorResponse)
+//                logShow("onReceivedHttpError")
+//                binding.swipRefresh.isRefreshing = false
+////                if (errorResponse?.statusCode != 400)
+//                    errorPage = true
+//
+//            }
+
+            override fun onReceivedSslError(
+                view: WebView?,
+                handler: SslErrorHandler?,
+                error: SslError?
+            ) {
+                super.onReceivedSslError(view, handler, error)
+                logShow("onReceivedSslError")
+
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                logShow("onReceivedError====>${error.toString()}")
+                binding.swipRefresh.isRefreshing = false
+//                    binding.webview.stopLoading()
+                errorPage = true
+            }
+        }
+    }
+
+    private fun addWebChromeClient() {
+        binding.webview.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                logShow("onShowFileChooser")
+                try {
+
+                    if (mUploadMessage != null) {
+                        mUploadMessage?.onReceiveValue(null)
+                        mUploadMessage = null
+                    }
+                    mUploadMessage = filePathCallback
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+
+                        val intent = fileChooserParams?.createIntent()
+                        try {
+                            intent?.let { startActivityForResult(it, REQUEST_SELECT_FILE) }
+                        } catch (e: ActivityNotFoundException) {
+                            mUploadMessage = null
+                            showToastMessage(R.string.not_found_file)
+                            return false
+                        }
+                        return true
+                    } else {
+                        openFileChooser(mUploadMessage)
+                    }
+                } catch (e: Exception) {
+                    mUploadMessage = null;
+                    showToastMessage(R.string.not_found_file)
+                    return false
+                }
+                return true
+            }
+
+            fun openFileChooser(uploadMsg: ValueCallback<Array<Uri>>?) {
+                //filePermission()
+//                    mUploadMessage = uploadMsg
+                val i = Intent(Intent.ACTION_GET_CONTENT)
+                i.addCategory(Intent.CATEGORY_OPENABLE)
+                i.type = "*/*" // set MIME type to filter
+                this@MainActivity.startActivityForResult(
+                    Intent.createChooser(i, "File Browser"),
+                    FILE_CHOOSER_RESULT_CODE
+                )
+
+            }
+
+        }
+    }
+
+    fun logShow(message: String) {
+        val tag = "TAG"
+        if (showLog)
+            Log.e(tag, message)
+    }
+
+    fun showToastMessage(message: Int) {
+        Toast.makeText(
+            getApplicationContext(), message,
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
+    fun showAnimation() {
+        binding.animationView.playAnimation()
+        binding.animationView.visibility = View.VISIBLE
+    }
+
+    fun hideAnimation() {
+        if (binding.animationView.isAnimating)
+            binding.animationView.cancelAnimation()
+        binding.animationView.visibility = View.GONE
+    }
+
+    fun showErrorPage() {
+//        binding.webview.stopLoading()
+        binding.webview.visibility = View.GONE
+        binding.cnsErrorContainer.visibility = View.VISIBLE
+        hideAnimation()
+    }
+
+    fun showWebview() {
+        binding.webview.visibility = View.VISIBLE
+        hideErrorPage()
+        hideAnimation()
+    }
+
+    fun hideErrorPage() {
+        binding.cnsErrorContainer.visibility = View.GONE
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    fun initWebviewSetting() {
+
+        this.binding.webview.settings.javaScriptEnabled = true
+        this.binding.webview.settings.domStorageEnabled = true
+        this.binding.webview.settings.javaScriptCanOpenWindowsAutomatically = false
+
+
+        this.binding.webview.settings.savePassword = false
+        this.binding.webview.settings.saveFormData = false
+
+
+        //these two line is for scaling webview content 100%(Fit to screen):
+        this.binding.webview.settings.loadWithOverviewMode = true
+        this.binding.webview.settings.useWideViewPort = true
+        this.binding.webview.settings.loadsImagesAutomatically = true
+        this.binding.webview.settings.setSupportMultipleWindows(false)
+        this.binding.webview.settings.setGeolocationEnabled(true)
+
+
+        this.binding.webview.settings.allowContentAccess = true
+        this.binding.webview.settings.allowFileAccess = true
+
+
+
+
+        this.binding.webview.clearCache(true);
+        this.binding.webview.clearHistory();
+        this.binding.webview.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+
+        if (Build.VERSION.SDK_INT >= 19) {
+            this.binding.webview.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        } else {
+            this.binding.webview.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+        }
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+        );
+
+        setUserAgent(USER_AGENT_APPENDED)
+
+//        binding.webview.isScrollContainer = false
+//        disableWebviewScrolling()
+    }
+
+    private fun setUserAgent(userAgent: String) {
+        val webSettings: WebSettings = binding.webview.settings
+        val newUserAgent: String
+        val stringBuilder = StringBuilder()
+        newUserAgent =
+            stringBuilder.append(webSettings.userAgentString).append(userAgent).toString()
+        webSettings.setUserAgentString(newUserAgent)
+    }
+
+    private fun isNetworkConnected(): Boolean {
+        //val connectivityManager = this.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val cm = this.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val networkInfo = cm.activeNetworkInfo
+        return networkInfo != null && networkInfo.isConnected
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (event.getAction() === KeyEvent.ACTION_DOWN) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_BACK -> {
+                    if (!binding.swipRefresh.isRefreshing)
+                        if (binding.webview.canGoBack()) {
+                            if (binding.webview.url.toString()
+                                    .equals(BACK_IN_LOGIN_URL)
+                            )
+                                onBackWithCustomAlertDialog()
+                            else if (!binding.webview.url.toString()
+                                    .equals(BACK_TO_LOGIN_URL)
+                            )
+                                binding.webview.goBack()
+                        } else {
+                            onBackWithCustomAlertDialog()
+                        }
+                    return true
+                }
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    private fun onBackWithCustomAlertDialog() {
+        val dialogLoyout = layoutInflater.inflate(R.layout.dialog_alert_exit, null)
+        var yesButton = dialogLoyout.findViewById<Button>(R.id.btn_yes)
+        var noButton = dialogLoyout.findViewById<Button>(R.id.btn_no)
+
+        val builder = AlertDialog.Builder(dialogLoyout.context)
+        builder.setView(dialogLoyout)
+        alertDialog = builder.create()
+        alertDialog.window?.setBackgroundDrawableResource(android.R.color.transparent);
+        alertDialog.show()
+        yesButton.setOnClickListener {
+            finish()
+        }
+        noButton.setOnClickListener {
+            with(alertDialog) { cancel() }
+        }
+    }
+
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, intent: Intent?) {
+        super.onActivityResult(requestCode, resultCode, intent)
+
+        if (requestCode == REQUEST_SELECT_FILE || requestCode == FILE_CHOOSER_RESULT_CODE) {
+            if (null == mUploadMessage || intent == null || resultCode != RESULT_OK) {
+                mUploadMessage!!.onReceiveValue(null)
+                mUploadMessage = null
+                showToastMessage(R.string.not_found_file)
+                return
+            } else {
+                super.onActivityResult(requestCode, resultCode, intent)
+            }
+            fileProviding(intent)
+
+        } else if (requestCode == REQUEST_PERMISSION) {
+            if (resultCode == RESULT_PERMISSION_OK) {
+                dexter.check()
+            } else showToastMessage(R.string.failed)
+        }
+
+    }
+
+    private fun fileProviding(intent: Intent?) {
+
+        var result: Array<Uri>? = null
+        val dataString = intent?.dataString
+        if (dataString != null) {
+            result = arrayOf(Uri.parse(dataString))
+        }
+        mUploadMessage!!.onReceiveValue(result)
+        mUploadMessage = null
+    }
+
+
+}
