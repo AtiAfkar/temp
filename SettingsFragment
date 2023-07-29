@@ -1,0 +1,690 @@
+package com.atiafkar.agentapp.fragments
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.Activity.RESULT_OK
+import android.app.AlertDialog
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Typeface
+import android.net.ConnectivityManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
+import android.util.Log
+import android.view.View
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
+import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.core.content.edit
+import androidx.databinding.DataBindingUtil
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.lifecycleScope
+import androidx.navigation.fragment.findNavController
+import com.atiafkar.agentapp.BuildConfig
+import com.atiafkar.agentapp.R
+import com.atiafkar.agentapp.database.DatabaseClient
+import com.atiafkar.agentapp.database.models.AndroidAppVersionBody
+import com.atiafkar.agentapp.database.models.LatestVersionReqModel
+import com.atiafkar.agentapp.database.models.WaterPriceWorkReadInfo
+import com.atiafkar.agentapp.databinding.FragmentSettingsBinding
+import com.atiafkar.agentapp.helperClasses.LoadingProgress
+import com.atiafkar.agentapp.helperClasses.ReadInfoState
+import com.atiafkar.agentapp.helperClasses.printer.Device
+import com.atiafkar.agentapp.helperClasses.printer.IPosPrinterEvent
+import com.atiafkar.agentapp.helperClasses.versionConverter
+import com.atiafkar.agentapp.repositories.ReadInfoRepository
+import com.atiafkar.agentapp.repositories.SettingsRepository
+import com.atiafkar.agentapp.viewModel.SettingsViewModel
+import com.atiafkar.agentapp.viewModel.SettingsViewModelFactory
+import com.atiafkar.agentapp.webservice.WebServiceFactory
+import com.atiafkar.agentapp.webservice.auth.AuthenticationHandler
+import com.google.android.material.snackbar.Snackbar
+import com.pax.gl.page.IPage
+import com.pax.gl.page.PaxGLPage
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.IOException
+
+
+class SettingsFragment : Fragment(R.layout.fragment_settings) {
+
+    private var _binding: FragmentSettingsBinding? = null
+    private val binding get() = _binding!!
+    private lateinit var dataBase: DatabaseClient
+    private lateinit var repository: SettingsRepository
+    private var isDownloadStarted = false
+    private var isUpdateAvailable = false
+    private lateinit var downloadLoadingDialog: LoadingProgress
+    private lateinit var webServiceFactory: WebServiceFactory
+    private var latestVersion = ""
+    private var currentVersion = ""
+    private var convertedVersion = doubleArrayOf()
+    private var noInternet = false
+    private var latestVersionUrl = ""
+    private lateinit var tryAgainAlertDialog: AlertDialog
+    private val mRequestPermissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            if (it[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+                && it[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
+            ) {
+                updateNow()
+            } else {
+                showToastMessage("برای بارگیری بروزرسانی برنامه اجازه دسترسی را صادر کنید")
+                findNavController().popBackStack()
+            }
+        }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private val mActivityResult =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (it.resultCode == RESULT_OK) {
+                if (requireActivity().packageManager.canRequestPackageInstalls()) {
+                    installUpdates()
+                } else {
+                    Toast.makeText(
+                        requireContext(),
+                        "برای مشاهده پیام نصب باید اجازه دسترسی را فعال کنید",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+
+    private val mGoToInstallPackage =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            when {
+
+                it.resultCode == Activity.RESULT_CANCELED ->
+                    Toast.makeText(
+                        requireContext(),
+                        "فرایند نصب بروزرسانی توسط کاربر لغو شد",
+                        Toast.LENGTH_LONG
+                    ).show()
+
+                it.resultCode == Activity.RESULT_OK -> {
+                    Toast.makeText(requireContext(), "نصب با موفقیت انجام شد", Toast.LENGTH_LONG)
+                        .show()
+                }
+
+                else ->
+                    Toast.makeText(
+                        requireContext(),
+                        "در فرایند نصب بروزرسانی برنامه خطایی رخ داده است",
+                        Toast.LENGTH_LONG
+                    ).show()
+            }
+        }
+    private val readInfoRepository by lazy {
+        ReadInfoRepository(
+            DatabaseClient.getDatabase(requireContext())
+                .waterPriceWorkReadInfoDao()
+        )
+    }
+    private lateinit var printerDevice: Device
+    private var canPrint = true
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        webServiceFactory =
+            WebServiceFactory(AuthenticationHandler(requireActivity()), requireContext())
+        currentVersion = BuildConfig.VERSION_NAME
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            checkVersionTask()
+        }
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        _binding = DataBindingUtil.bind(view)
+        dataBase = DatabaseClient.getDatabase(requireContext().applicationContext)
+        printerDevice = Device.getInstance(requireContext())
+        downloadLoadingDialog =
+            LoadingProgress(requireActivity(), "درحال بارگذاری بروزرسانی برنامه")
+
+        binding.versionCode.text = currentVersion
+
+
+        if (isUpdateAvailable)
+            binding.updateNowHint.visibility = View.VISIBLE
+        else
+            binding.updateNowHint.visibility = View.GONE
+
+//        if (Instabug.isEnabled()) {
+//            binding.btnErrorReport.setTextColor(resources.getColor(R.color.colorPrimary))
+//        } else {
+//            binding.btnErrorReport.setTextColor(resources.getColor(R.color.gray100))
+//        }
+
+        repository = SettingsRepository(
+            webServiceFactory
+        )
+        tryAgainDialogCreate()
+
+        binding.logout.setOnClickListener {
+            CoroutineScope(Dispatchers.Main).launch {
+                if (readItemExist())
+                    tryAgainAlertDialog.show()
+                else
+                    logout()
+            }
+        }
+        val viewModel by viewModels<SettingsViewModel> {
+            SettingsViewModelFactory(repository)
+        }
+
+        binding.vm = viewModel
+        binding.lifecycleOwner = viewLifecycleOwner
+        binding.topAppBar.setNavigationOnClickListener {
+            findNavController().popBackStack()
+        }
+
+        binding.updateNow.setOnClickListener {
+            Log.e("TAG", "updata:$isUpdateAvailable")
+            Log.e("TAG", "noInternet:$noInternet")
+            Log.e("TAG", "isDownloadStarted:$isDownloadStarted")
+            when {
+                isUpdateAvailable && !noInternet -> getLink()
+                noInternet -> checkVersionTask()
+                !isUpdateAvailable -> showSnackbarMessage("برنامه شما بروز می باشد")
+            }
+        }
+
+//        binding.btnErrorReport.setOnClickListener {
+//            if (Instabug.isEnabled()) {
+//                Instabug.disable()
+//                binding.btnErrorReport.setTextColor(resources.getColor(R.color.gray100))
+//            } else {
+//                Instabug.enable()
+//                binding.btnErrorReport.setTextColor(resources.getColor(R.color.colorPrimary))
+//            }
+//
+//        }
+
+        binding.updateNowHint.setOnClickListener {
+            checkPermission()
+        }
+
+        /*binding.addNewVersion.setOnClickListener {
+            lifecycleScope.launch(Dispatchers.IO){
+                val response = webServiceFactory.apiService?.addVersionTest(AppVersionModel(
+                    "https://www.dropbox.com/s/spqziidvynfzx39/Agent-App-1.7.1-Main_SIG.apk?dl=1" ,
+                    "1.7.1" ,
+                    true ,
+                    true ,
+                    1
+                ))
+                if(response?.isSuccessful == true ) {
+                    if(response.body()?.equals(800) == true ){
+                        activity?.runOnUiThread {
+                            Toast.makeText(requireContext() , "addeddddd" , Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            }
+        }*/
+
+    }
+
+    private fun showSnackbarMessage(message: String) {
+        Snackbar.make(
+            binding.root,
+            message,
+            Snackbar.LENGTH_LONG
+        ).show()
+    }
+
+    private fun showToastMessage(message: String) {
+        Toast.makeText(
+            requireContext(),
+            message,
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
+    private fun getLink() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            Log.e("TAG", "getApplicationLink======start")
+
+            val response = webServiceFactory.apiService?.getApplicationLink(
+                AndroidAppVersionBody(
+                    latestVersion,
+                    1
+                )
+            )
+            activity?.runOnUiThread {
+                if (response?.isSuccessful == true) {
+                    if (response.body() != null) {
+                        latestVersionUrl = response.body()!!
+//                                    latestVersionUrl = "https://download948.mediafire.com/30ewfu6kpiog/o1uibpeg0mv6nle/Agent-App-1.9.1-4010815-debug.apk"
+//                                    latestVersionUrl = "https://download1584.mediafire.com/0nu9tquosowg/g7mp7cihr5n0ou2/Agent-App-1.9.1-4010811.apk"
+//                                    latestVersionUrl =
+//                                        "https://s6.uplod.ir:182/d/2k2qvlei4hvhuf6ty6nzzydmvyi3j4c2ufijznqazrpdaeo5ebik4itmfkgc7kbi5voiinul/Agent-App-1.9.1-4010811.apk"
+                        Log.e("TAG", "appLinkResponse======${response.body()!!}")
+                        Log.e("TAG", "latestVersionUrl======$latestVersionUrl")
+                        checkPermission()
+                    } else
+                        showToastMessage("دریافت لینک دانلود با خطایی مواجه شده است")
+                } else
+                    showSnackbarMessage("خطا در اتصال")
+            }
+        }
+    }
+
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+        tryAgainAlertDialog.dismiss()
+    }
+
+    private fun isNetworkConnected(): Boolean {
+        val cm =
+            requireActivity().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val networkInfo = cm.activeNetworkInfo
+        return networkInfo != null && networkInfo.isConnected
+    }
+
+
+    private suspend fun logOut(progress: LoadingProgress) {
+        withContext(Dispatchers.IO) {
+            dataBase.clearAllTables()
+//            repository.invalidate()
+            binding.vm?.invalidate()
+            activity?.runOnUiThread {
+                if (progress.isCanceled()) progress.dismissDialog()
+                requireContext().getSharedPreferences(
+                    requireContext().packageName,
+                    Context.MODE_PRIVATE
+                ).edit {
+                    putInt("firstLogIn", -1)
+                    apply()
+                }
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun checkPermission() {
+        if (isUpdateAvailable) {
+            downloadLoadingDialog.startLoadingProgress()
+            if (ContextCompat.checkSelfPermission(
+                    requireActivity(),
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ) != PackageManager.PERMISSION_GRANTED
+                && ContextCompat.checkSelfPermission(
+                    requireActivity(),
+                    Manifest.permission.READ_EXTERNAL_STORAGE
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                mRequestPermissions.launch(
+                    arrayOf(
+                        Manifest.permission.READ_EXTERNAL_STORAGE,
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE
+                    )
+                )
+            } else updateNow()
+
+        } else {
+            showSnackbarMessage("برنامه بروز می باشد")
+        }
+    }
+
+    private fun updateNow() {
+        Log.e("TAG", "updateNow====> started")
+        if (!isDownloadStarted) {
+
+            val mFile =
+                File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath)
+            if (!mFile.exists())
+                mFile.mkdir()
+
+            val dlFile =
+                File(mFile.toString() + File.separator + requireActivity().packageName + ".apk")
+            if (dlFile.exists()) dlFile.delete()
+
+            val uri =
+                if (!dlFile.absolutePath.endsWith(".apk") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    FileProvider.getUriForFile(
+                        requireContext(),
+                        BuildConfig.APPLICATION_ID + ".provider",
+                        dlFile
+                    )
+                } else Uri.fromFile(dlFile)
+            Log.e("TAG", "Uri.parse(latestVersionUrl)======${Uri.parse(latestVersionUrl.trim())}")
+
+            val dlManagerRequest = DownloadManager.Request(Uri.parse(latestVersionUrl))
+            dlManagerRequest.setTitle("آپدیت برنامه قرائت")
+            dlManagerRequest.setDestinationUri(uri)
+            dlManagerRequest.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+
+            val dlManager =
+                requireContext().getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            dlManager.enqueue(dlManagerRequest)
+
+            isDownloadStarted = true
+
+            val onDownloadComplete = object : BroadcastReceiver() {
+                @RequiresApi(Build.VERSION_CODES.O)
+                @SuppressLint("SetWorldReadable")
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    downloadLoadingDialog.dismissDialog()
+                    Log.e("TAG", "DownloadManager.onReceive====>finished")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        if (!requireActivity().packageManager.canRequestPackageInstalls()) {
+                            mActivityResult.launch(
+                                (Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).setData(
+                                    Uri.parse(
+                                        String.format("package:%s", requireActivity().packageName)
+                                    )
+                                ))
+                            )
+                            isDownloadStarted = false
+                        } else {
+                            installUpdates()
+                        }
+                    } else {
+                        installUpdates()
+                    }
+                    requireActivity().unregisterReceiver(this)
+                }
+            }
+            requireActivity().registerReceiver(
+                onDownloadComplete,
+                IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+            )
+        }
+
+    }
+
+    private fun installUpdates() {
+        Log.e("TAG", "installUpdates====> started")
+        with(requireActivity()) {
+            try {
+                val file =
+                    File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath)
+
+                val newFiles = File(file, "$packageName.apk")
+
+                val fileUri = if (Build.VERSION.SDK_INT >= 24) {
+                    FileProvider.getUriForFile(
+                        this,
+                        applicationContext.packageName + ".provider",
+                        newFiles
+                    )
+                } else {
+                    Uri.fromFile(newFiles)
+                }
+                Log.e("TAG", "fileUri====> ${fileUri.path}")
+                val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+                    setDataAndType(fileUri, "application/vnd.android.package-archive")
+                    flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                }
+
+                mGoToInstallPackage.launch(installIntent)
+
+            } catch (e: Exception) {
+                Toast.makeText(
+                    requireContext(),
+                    R.string.error_installing,
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    private fun onNewVersionAvailable() {
+        activity?.runOnUiThread {
+            binding.updateNowHint.visibility = View.VISIBLE
+            isUpdateAvailable = true
+        }
+    }
+
+    private fun checkVersionTask() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            if (isNetworkConnected()) {
+                webServiceFactory.apiService?.getLatestVersion(
+                    LatestVersionReqModel(
+                        1,
+                        currentVersion
+                    )
+                )?.body()
+                    ?.let {
+                        latestVersion = it
+                        convertedVersion = versionConverter(currentVersion, it)
+                        if (convertedVersion[1] != 0.0) {
+                            if (convertedVersion[0] < convertedVersion[1])
+                                onNewVersionAvailable()
+                        }
+                    }
+//                noInternet = false
+            } else {
+                lifecycleScope.launch(Dispatchers.Main) {
+                    showToastMessage("عدم دسترسی به اینترنت")
+                }
+                noInternet = true
+            }
+        }
+    }
+
+    companion object {
+        const val dlDescription = "آپدیت نرم افزار با موفقیت دانلود شد"
+    }
+
+    private fun tryAgainDialogCreate() {
+        tryAgainAlertDialog = this.let {
+            val builder = AlertDialog.Builder(requireContext()).apply {
+                setView(
+                    it.layoutInflater.inflate(
+                        R.layout.readinfo_exist_alert,
+                        ConstraintLayout(requireContext())
+                    )
+                )
+                setPositiveButton("خروج") { _, id ->
+                    logout()
+                }
+                setNegativeButton("پرینت اطلاعات") { _, id ->
+                    printAllReadItem()
+                    tryAgainAlertDialog.dismiss()
+                }
+            }
+            builder.setCancelable(true)
+            builder.create()
+        }
+    }
+
+    private fun printAllReadItem() {
+        CoroutineScope(Dispatchers.Main).launch {
+            printer(fetchAllWaterPriceWorkReadInfoByState(ReadInfoState.READ))
+
+        }
+//        CoroutineScope(Dispatchers.IO).launch {
+//            exportToFile(fetchAllWaterPriceWorkReadInfoByState(ReadInfoState.READ))
+//
+//        }
+    }
+
+    private suspend fun readItemExist(): Boolean {
+        var readItemList =
+            fetchAllWaterPriceWorkReadInfoByState(ReadInfoState.READ)
+        var size = readItemList.size
+        Log.e("TAG", "READ Item size : $size")
+        return readItemList.isNotEmpty()
+    }
+
+    private suspend fun fetchAllWaterPriceWorkReadInfoByState(state: ReadInfoState): List<WaterPriceWorkReadInfo> {
+        return withContext(Dispatchers.IO) {
+            readInfoRepository.getAllByStateSync(state)
+        }
+    }
+
+    private fun logout() {
+        val progress = LoadingProgress(requireActivity(), "در حال خروج لطفا منتظر بمانید")
+        progress.startLoadingProgress()
+        activity?.lifecycleScope?.launch {
+            delay(1500)
+            logOut(progress)
+        }
+    }
+
+    private fun printer(readInfoList: List<WaterPriceWorkReadInfo>) {
+        if (canPrint) {
+            lifecycleScope.launch(Dispatchers.IO) {
+
+                printerDevice.print(generateBitmap(readInfoList), object : IPosPrinterEvent {
+                    override fun onPrintStarted() {
+                        activity?.runOnUiThread {
+                            Snackbar.make(
+                                binding.root,
+                                "پرینت در حال انجام است",
+                                Snackbar.LENGTH_LONG
+                            ).show()
+                            canPrint = false
+                        }
+                    }
+
+                    override fun onPrinterError(error: String?, isPaperError: Boolean) {
+                        activity?.runOnUiThread {
+                            Snackbar.make(
+                                binding.root,
+                                "فرایند با خطایی روبه رو شده است",
+                                Snackbar.LENGTH_LONG
+                            ).show()
+                            canPrint = true
+                        }
+                    }
+
+                    override fun onPrintEnd() {
+                        canPrint = true
+                    }
+                })
+            }
+        }
+    }
+
+    private fun generateBitmap(readInfoList: List<WaterPriceWorkReadInfo>): Bitmap {
+        val FONT_NORMAL = 20
+        val typeFace = Typeface.createFromAsset(activity?.assets, "fonts/iransans.ttf")
+        val iPaxGLPage = PaxGLPage.getInstance(requireContext())
+        val iPage: IPage = iPaxGLPage.createPage()
+        readInfoList.sortedBy { it.subscriberCode }.forEachIndexed { index, readItem ->
+            Log.e("TAG", "READ Item  : ${readItem.tblSubscriberId}")
+            iPage.apply {
+                typefaceObj = typeFace
+                if (index == 0) {
+                    /*addLine().addUnit(getImageFromAssets("abfa_printable.png") , IPage.EAlign.CENTER)*/
+                    addLine().addUnit(
+                        getString(R.string.abfaCompany),
+                        FONT_NORMAL,
+                        IPage.EAlign.CENTER,
+                        IPage.ILine.IUnit.TEXT_STYLE_BOLD
+                    )
+                    addLine().addUnit(
+                        readItem.subscriberName.toString().trim(),
+                        FONT_NORMAL,
+                        IPage.EAlign.RIGHT
+                    ).addUnit("نام کاربر: ", FONT_NORMAL, IPage.EAlign.LEFT)
+                    addLine().addUnit(
+                        readItem.identityCode.toString(),
+                        FONT_NORMAL,
+                        IPage.EAlign.RIGHT
+                    ).addUnit("شناسه قرائت:", FONT_NORMAL, IPage.EAlign.LEFT)
+                    addLine().addUnit(
+                        "########################",
+                        FONT_NORMAL,
+                        IPage.EAlign.CENTER
+                    )
+//                    addLine().addUnit(
+//                        "#### ${readItem.readDate.toString().trim()} ####",
+//                        FONT_NORMAL,
+//                        IPage.EAlign.CENTER,
+//                        IPage.ILine.IUnit.TEXT_STYLE_BOLD
+//                    )
+                    addLine().addUnit(
+                        readItem.readStateDesc.toString(),
+                        FONT_NORMAL,
+                        IPage.EAlign.RIGHT
+                    ).addUnit(readItem.subscriberCode.toString(), FONT_NORMAL, IPage.EAlign.RIGHT)
+
+                    addLine().addUnit(
+                        readItem.readNumber?.toString() ?: "--",
+                        FONT_NORMAL,
+                        IPage.EAlign.LEFT
+                    ).addUnit(readItem.readViewDescs.toString(), FONT_NORMAL, IPage.EAlign.LEFT)
+                    addLine().addUnit(
+                        "~~~~~~~~~~~~~~~~~~~~~",
+                        FONT_NORMAL,
+                        IPage.EAlign.CENTER
+                    )
+                } else {
+//                    addLine().addUnit(
+//                        "~~~~ ${readItem.readDate.toString().trim()} ~~~~",
+//                        FONT_NORMAL,
+//                        IPage.EAlign.CENTER,
+//                        IPage.ILine.IUnit.TEXT_STYLE_BOLD
+//                    )
+                    addLine().addUnit(
+                        readItem.readStateDesc.toString(),
+                        FONT_NORMAL,
+                        IPage.EAlign.RIGHT
+                    ).addUnit(readItem.subscriberCode.toString(), FONT_NORMAL, IPage.EAlign.RIGHT)
+
+                    addLine().addUnit(
+                        readItem.readNumber?.toString() ?: "--",
+                        FONT_NORMAL,
+                        IPage.EAlign.LEFT
+                    ).addUnit(readItem.readViewDescs.toString(), FONT_NORMAL, IPage.EAlign.LEFT)
+
+                    addLine().addUnit(
+                        "~~~~~~~~~~~~~~~~~~~~~",
+                        FONT_NORMAL,
+                        IPage.EAlign.CENTER
+                    )
+                }
+            }
+        }
+
+        val width = 384
+        return iPaxGLPage.pageToBitmap(iPage, width)
+    }
+
+    fun exportToFile(readInfoList: List<WaterPriceWorkReadInfo>) {
+        try {
+
+            val csvHeader =
+                arrayOf("تاریخ قرائت:", "اشتراک:", "وضعیت قرائت:", "شماره قرائت:", "مشاهده قرائت:")
+            val csvRows = readInfoList.map { readItem ->
+                arrayOf(
+                    readItem.readDate ?: "",
+                    readItem.subscriberCode ?: "",
+                    readItem.readStateDesc ?: "",
+                    readItem.readNumber?.toString() ?: "--",
+                    readItem.readViewDescs ?: ""
+                ).joinToString(",")
+            }
+            val csvContent = csvHeader.joinToString(",") + "\n" + csvRows.joinToString("\n")
+
+            val writer = File("output.csv").printWriter()
+            writer.write(csvContent)
+            writer.close()
+        } catch (e: IOException) {
+            Log.e("TAG", "CSV EXPORT: $e")
+        }
+    }
+}
